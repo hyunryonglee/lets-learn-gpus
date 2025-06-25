@@ -170,98 +170,6 @@ void launch_matmul_shmem(
 };
 
 ////////////////////////////////////////////////////////////////////////////////
-// GPU Implementation again for interview prep... use shared memory
-// Bring in TILE_DIM_M x TILE_DIM_K of A, and TILE_DIM_K x TILE_DIM_N of B
-// to shared memory. Perform matmul up to TILE_DIM_K.
-// Then, bring in the next TILE_DIM_K amount of A and B.
-// Increases arithmetic intensity by ~TILE_DIM_K.
-// 
-// Now include register reuse by having each thread output UM x UN output elements.
-
-
-
-////////////////////////////////////////////////////////////////////////////////
-// GPU Implementation (With Reuse in L1/Shmem)
-
-namespace matmul_l1 {
-
-constexpr int32_t TILE_DIM_M = 32;
-constexpr int32_t TILE_DIM_N = 32;
-constexpr int32_t TILE_DIM_K = 32;
-
-typedef struct {
-    float a_tile[TILE_DIM_M][TILE_DIM_K];
-    float b_tile[TILE_DIM_K][TILE_DIM_N];
-} ShMem;
-
-__global__ void matmul_l1(
-    int32_t size_i,
-    int32_t size_j,
-    int32_t size_k,
-    float const *a,
-    float const *b,
-    float *c) {
-    /* TODO: your GPU code here */
-    int32_t TILE_IDX_Y = blockIdx.y;
-    int32_t TILE_IDX_X = blockIdx.x;
-    int32_t INPUT_TILE_CNT = (size_k + TILE_DIM_K - 1) / TILE_DIM_K;
-
-    extern __shared__ ShMem shmem[];
-
-    float sum = 0.0;
-
-    int32_t c_tile_x = TILE_IDX_X * TILE_DIM_N + threadIdx.x;
-    int32_t c_tile_y = TILE_IDX_Y * TILE_DIM_M + threadIdx.y;
-    int32_t a_tile_y = c_tile_y;
-    int32_t b_tile_x = c_tile_x;
-
-    for (int32_t tile_idx = 0; tile_idx < INPUT_TILE_CNT; ++tile_idx) {
-        int32_t a_tile_x = tile_idx * TILE_DIM_K + threadIdx.x;
-        int32_t b_tile_y = tile_idx * TILE_DIM_K + threadIdx.y;
-
-        if (c_tile_y < size_i && c_tile_x < size_j && threadIdx.x < TILE_DIM_K) {
-            shmem->a_tile[threadIdx.y][threadIdx.x] = a[a_tile_y * size_k + a_tile_x];
-            
-        }
-
-        if (c_tile_y < size_i && c_tile_x < size_j && threadIdx.y < TILE_DIM_K) {
-            shmem->b_tile[threadIdx.y][threadIdx.x] = b[b_tile_y * size_j + b_tile_x];
-        }
-
-        __syncthreads();
-
-
-        for (int32_t k = 0; k < TILE_DIM_K; ++k) {
-            sum += shmem->a_tile[threadIdx.y][k] * shmem->b_tile[k][threadIdx.x];
-        }
-
-        __syncthreads();
-    }
-
-    if (c_tile_y < size_i && c_tile_x < size_j) {
-        c[c_tile_y * size_j + c_tile_x] = sum;
-    }
-}
-
-void launch_matmul_l1(
-    int32_t size_i,
-    int32_t size_j,
-    int32_t size_k,
-    float const *a,
-    float const *b,
-    float *c) {
-    /* TODO: your CPU code here */
-    int32_t GRID_DIM_X = (size_j + TILE_DIM_N - 1) / TILE_DIM_N;
-    int32_t GRID_DIM_Y = (size_i + TILE_DIM_M - 1) / TILE_DIM_M;
-    dim3 grid_dim(GRID_DIM_X, GRID_DIM_Y);
-    dim3 block_dim(TILE_DIM_N, TILE_DIM_M);
-    auto SHMEM_SIZE = sizeof(ShMem);
-    matmul_l1<<<grid_dim, block_dim, SHMEM_SIZE>>>(size_i, size_j, size_k, a, b, c);
-}
-
-}; // namespace matmul_l1
-
-////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Reuse in L1/Shmem and Registers)
 
 namespace matmul_l1_reg {
@@ -309,25 +217,17 @@ __global__ void matmul_l1_reg(
         int32_t b_tile_k = tile_idx * TILE_DIM_K;
         for (int32_t a_shmem_i = threadIdx.y; a_shmem_i < TILE_DIM_M; a_shmem_i += NTHREADS_Y) {
             for (int32_t a_shmem_k = threadIdx.x; a_shmem_k < TILE_DIM_K; a_shmem_k += NTHREADS_X) {
-                //if (a_tile_I + a_shmem_i < size_i && a_tile_k + a_shmem_k < size_k) {
-                    shmem->a_tile[a_shmem_k][a_shmem_i] = a[(a_tile_I + a_shmem_i) * size_k + (a_tile_k + a_shmem_k)];
-                //}
+                shmem->a_tile[a_shmem_k][a_shmem_i] = a[(a_tile_I + a_shmem_i) * size_k + (a_tile_k + a_shmem_k)];
             }
         }
 
         for (int32_t b_shmem_k = threadIdx.y; b_shmem_k < TILE_DIM_K; b_shmem_k += NTHREADS_Y) {
             for (int32_t b_shmem_j = threadIdx.x; b_shmem_j < TILE_DIM_N; b_shmem_j += NTHREADS_X) {
-                //if (b_tile_k + b_shmem_k < size_k && b_tile_J + b_shmem_j < size_j) {
-                    shmem->b_tile[b_shmem_k][b_shmem_j] = b[(b_tile_k + b_shmem_k) * size_j + (b_tile_J + b_shmem_j)];
-                //}
+                shmem->b_tile[b_shmem_k][b_shmem_j] = b[(b_tile_k + b_shmem_k) * size_j + (b_tile_J + b_shmem_j)];
             }
         }
 
         __syncthreads();
-
-        //if (TILE_IDX_X == 3 && TILE_IDX_Y == 3 && threadIdx.x == 3 && threadIdx.y == 5 && tile_idx == 3) {
-        //    printf("shmem_a_tile[%d][%d] = %f\n", threadIdx.y, threadIdx.x, shmem->a_tile[threadIdx.y][threadIdx.x]);
-        //}
 
         // Compute the output tile.
         for (int32_t k = 0; k < TILE_DIM_K; k++) {
@@ -548,19 +448,6 @@ struct MatmulShmem {
 };
 
 
-struct MatmulL1 {
-    constexpr static char const *name = "matmul_l1";
-    static void
-    run(int32_t size_i,
-        int32_t size_j,
-        int32_t size_k,
-        float const *a,
-        float const *b,
-        float *c) {
-        matmul_l1::launch_matmul_l1(size_i, size_j, size_k, a, b, c);
-    }
-};
-
 struct MatmulL1Reg {
     constexpr static char const *name = "matmul_l1_reg";
     static void
@@ -584,7 +471,6 @@ int main(int argc, char **argv) {
 
     run_all_tests<MatmulBaseline>(test_data_dir, saved_results);
     run_all_tests<MatmulShmem>(test_data_dir, saved_results);
-    run_all_tests<MatmulL1>(test_data_dir, saved_results);
     run_all_tests<MatmulL1Reg>(test_data_dir, saved_results);
 
     if (saved_results.size() > 1) {
